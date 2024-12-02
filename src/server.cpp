@@ -22,10 +22,10 @@ struct DNSQuestion {
     uint16_t qclass;
 };
 
-void create_dns_header(char* response, const DNSHeader& request_header) {
+void create_dns_header(char* response, const DNSHeader& request_header, uint16_t qdcount, uint16_t ancount) {
     DNSHeader response_header;
     response_header.id = request_header.id;
-    
+
     uint16_t qr = 1;
     uint16_t opcode = (ntohs(request_header.flags) >> 11) & 0xF;
     uint16_t aa = 0;
@@ -36,9 +36,9 @@ void create_dns_header(char* response, const DNSHeader& request_header) {
     uint16_t rcode = (opcode == 0) ? 0 : 4;
 
     response_header.flags = htons((qr << 15) | (opcode << 11) | (aa << 10) | (tc << 9) | (rd << 8) | (ra << 7) | (z << 4) | rcode);
-    
-    response_header.qdcount = htons(1);
-    response_header.ancount = htons(1);
+
+    response_header.qdcount = htons(qdcount);
+    response_header.ancount = htons(ancount);
     response_header.nscount = htons(0);
     response_header.arcount = htons(0);
 
@@ -49,12 +49,20 @@ DNSQuestion parse_dns_question(const char* buffer, size_t& offset) {
     DNSQuestion question;
     uint8_t length;
 
-    while ((length = buffer[offset]) != 0) {
-        for (int i = 0; i < length; i++) {
-            question.qname.push_back(buffer[offset + i + 1]);
+    while (true) {
+        length = buffer[offset];
+        if ((length & 0xC0) == 0xC0) {  // Compressed label
+            offset += 2;  // Skip the pointer
+            break;
+        } else if (length == 0) {
+            break;
+        } else {
+            for (int i = 0; i < length; i++) {
+                question.qname.push_back(buffer[offset + i + 1]);
+            }
+            question.qname.push_back('.');
+            offset += length + 1;
         }
-        question.qname.push_back('.');
-        offset += length + 1;
     }
     if (!question.qname.empty()) {
         question.qname.pop_back();  // Remove trailing dot
@@ -146,8 +154,8 @@ int main() {
     socklen_t clientAddrLen = sizeof(clientAddress);
 
     while (true) {
-        int bytesRead = recvfrom(udpSocket, buffer, sizeof(buffer), 0, 
-                                 reinterpret_cast<struct sockaddr*>(&clientAddress), 
+        int bytesRead = recvfrom(udpSocket, buffer, sizeof(buffer), 0,
+                                 reinterpret_cast<struct sockaddr*>(&clientAddress),
                                  &clientAddrLen);
         if (bytesRead == -1) {
             std::cerr << "Error receiving data: " << strerror(errno) << std::endl;
@@ -161,16 +169,26 @@ int main() {
 
         DNSHeader* request_header = reinterpret_cast<DNSHeader*>(buffer);
         size_t offset = sizeof(DNSHeader);
-        DNSQuestion question = parse_dns_question(buffer, offset);
+        std::vector<DNSQuestion> questions;
+
+        for (uint16_t i = 0; i < ntohs(request_header->qdcount); ++i) {
+            questions.push_back(parse_dns_question(buffer, offset));
+        }
 
         // Create DNS response
-        create_dns_header(response, *request_header);
-        size_t questionSize = create_question(response + sizeof(DNSHeader), question);
-        size_t answerSize = create_answer(response + sizeof(DNSHeader) + questionSize, question);
-        size_t responseSize = sizeof(DNSHeader) + questionSize + answerSize;
+        create_dns_header(response, *request_header, questions.size(), questions.size());
+        size_t responseOffset = sizeof(DNSHeader);
 
-        if (sendto(udpSocket, response, responseSize, 0, 
-                   reinterpret_cast<struct sockaddr*>(&clientAddress), 
+        for (const auto& question : questions) {
+            responseOffset += create_question(response + responseOffset, question);
+        }
+
+        for (const auto& question : questions) {
+            responseOffset += create_answer(response + responseOffset, question);
+        }
+
+        if (sendto(udpSocket, response, responseOffset, 0,
+                   reinterpret_cast<struct sockaddr*>(&clientAddress),
                    sizeof(clientAddress)) == -1) {
             std::cerr << "Failed to send response: " << strerror(errno) << std::endl;
         }
@@ -179,4 +197,3 @@ int main() {
     close(udpSocket);
     return 0;
 }
-
