@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <vector>
 
 struct DNSHeader {
     uint16_t id;
@@ -14,6 +15,12 @@ struct DNSHeader {
     uint16_t arcount;
 };
 
+struct DNSQuestion {
+    std::vector<uint8_t> qname;
+    uint16_t qtype;
+    uint16_t qclass;
+};
+
 void create_dns_header(char* response, const DNSHeader& request_header) {
     DNSHeader response_header;
     response_header.id = request_header.id;
@@ -22,7 +29,7 @@ void create_dns_header(char* response, const DNSHeader& request_header) {
     uint16_t opcode = (ntohs(request_header.flags) >> 11) & 0xF;
     uint16_t aa = 0;
     uint16_t tc = 0;
-    uint16_t rd = (ntohs(request_header.flags) >> 8) & 0x1;  // Extract RD from request
+    uint16_t rd = (ntohs(request_header.flags) >> 8) & 0x1;
     uint16_t ra = 0;
     uint16_t z = 0;
     uint16_t rcode = (opcode == 0) ? 0 : 4;
@@ -37,51 +44,73 @@ void create_dns_header(char* response, const DNSHeader& request_header) {
     memcpy(response, &response_header, sizeof(DNSHeader));
 }
 
-size_t create_question(char* response) {
-    unsigned char domain[] = {
-        12, 'c','o','d','e','c','r','a','f','t','e','r','s',
-        2, 'i','o',
-        0  // Null terminator
-    };
-    
-    size_t domainLength = sizeof(domain);
-    memcpy(response, domain, domainLength);
+DNSQuestion parse_dns_question(const char* buffer, size_t& offset) {
+    DNSQuestion question;
+    uint8_t length;
 
-    uint16_t qtype = htons(1);  // A record
-    memcpy(response + domainLength, &qtype, 2);
+    while ((length = buffer[offset]) != 0) {
+        for (int i = 0; i < length; i++) {
+            question.qname.push_back(buffer[offset + i + 1]);
+        }
+        question.qname.push_back('.');
+        offset += length + 1;
+    }
+    if (!question.qname.empty()) {
+        question.qname.pop_back();  // Remove trailing dot
+    }
+    offset++;  // Skip the null byte
 
-    uint16_t qclass = htons(1);  // IN class
-    memcpy(response + domainLength + 2, &qclass, 2);
+    memcpy(&question.qtype, buffer + offset, 2);
+    question.qtype = ntohs(question.qtype);
+    offset += 2;
 
-    return domainLength + 4; // Domain length + Type (2 bytes) + Class (2 bytes)
+    memcpy(&question.qclass, buffer + offset, 2);
+    question.qclass = ntohs(question.qclass);
+    offset += 2;
+
+    return question;
 }
 
-size_t create_answer(char* response) {
-    unsigned char domain[] = {
-        12, 'c','o','d','e','c','r','a','f','t','e','r','s',
-        2, 'i','o',
-        0  // Null terminator
-    };
-    
-    size_t domainLength = sizeof(domain);
-    memcpy(response, domain, domainLength);
+size_t create_question(char* response, const DNSQuestion& question) {
+    size_t offset = 0;
+    for (size_t i = 0; i < question.qname.size(); ) {
+        size_t dot_pos = question.qname.find('.', i);
+        if (dot_pos == std::string::npos) dot_pos = question.qname.size();
+        uint8_t length = dot_pos - i;
+        response[offset++] = length;
+        memcpy(response + offset, &question.qname[i], length);
+        offset += length;
+        i = dot_pos + 1;
+    }
+    response[offset++] = 0;  // Null terminator
 
-    uint16_t type = htons(1);  // A record
-    memcpy(response + domainLength, &type, 2);
+    uint16_t qtype = htons(question.qtype);
+    memcpy(response + offset, &qtype, 2);
+    offset += 2;
 
-    uint16_t class_ = htons(1);  // IN class
-    memcpy(response + domainLength + 2, &class_, 2);
+    uint16_t qclass = htons(question.qclass);
+    memcpy(response + offset, &qclass, 2);
+    offset += 2;
+
+    return offset;
+}
+
+size_t create_answer(char* response, const DNSQuestion& question) {
+    size_t offset = create_question(response, question);
 
     uint32_t ttl = htonl(60);  // TTL of 60 seconds
-    memcpy(response + domainLength + 4, &ttl, 4);
+    memcpy(response + offset, &ttl, 4);
+    offset += 4;
 
     uint16_t rdlength = htons(4);  // Length of RDATA (4 bytes for IPv4)
-    memcpy(response + domainLength + 8, &rdlength, 2);
+    memcpy(response + offset, &rdlength, 2);
+    offset += 2;
 
     uint32_t ip = htonl(0x08080808);  // 8.8.8.8 as an example IP
-    memcpy(response + domainLength + 10, &ip, 4);
+    memcpy(response + offset, &ip, 4);
+    offset += 4;
 
-    return domainLength + 14;  // Domain length + 10 bytes for other fields + 4 bytes for IP
+    return offset;
 }
 
 int main() {
@@ -130,11 +159,13 @@ int main() {
         }
 
         DNSHeader* request_header = reinterpret_cast<DNSHeader*>(buffer);
+        size_t offset = sizeof(DNSHeader);
+        DNSQuestion question = parse_dns_question(buffer, offset);
 
         // Create DNS response
         create_dns_header(response, *request_header);
-        size_t questionSize = create_question(response + sizeof(DNSHeader));
-        size_t answerSize = create_answer(response + sizeof(DNSHeader) + questionSize);
+        size_t questionSize = create_question(response + sizeof(DNSHeader), question);
+        size_t answerSize = create_answer(response + sizeof(DNSHeader) + questionSize, question);
         size_t responseSize = sizeof(DNSHeader) + questionSize + answerSize;
 
         if (sendto(udpSocket, response, responseSize, 0, 
@@ -147,4 +178,3 @@ int main() {
     close(udpSocket);
     return 0;
 }
-
