@@ -5,20 +5,36 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
-void create_dns_header(char* response) {
-    uint16_t packetID = htons(1234);       // 2 bytes, Packet Identifier
-    uint16_t flags = htons(0x8180);        // 2 bytes, QR=1, OPCODE=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0
-    uint16_t qdcount = htons(1);           // 2 bytes, Question Count
-    uint16_t ancount = htons(1);           // 2 bytes, Answer Record Count (updated to 1)
-    uint16_t nscount = htons(0);           // 2 bytes, Authority Record Count
-    uint16_t arcount = htons(0);           // 2 bytes, Additional Record Count
+struct DNSHeader {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
 
-    memcpy(response, &packetID, 2);
-    memcpy(response + 2, &flags, 2);
-    memcpy(response + 4, &qdcount, 2);
-    memcpy(response + 6, &ancount, 2);
-    memcpy(response + 8, &nscount, 2);
-    memcpy(response + 10, &arcount, 2);
+void create_dns_header(char* response, const DNSHeader& request_header) {
+    DNSHeader response_header;
+    response_header.id = request_header.id;
+    
+    uint16_t qr = 1;
+    uint16_t opcode = (ntohs(request_header.flags) >> 11) & 0xF;
+    uint16_t aa = 0;
+    uint16_t tc = 0;
+    uint16_t rd = (ntohs(request_header.flags) >> 8) & 0x1;  // Extract RD from request
+    uint16_t ra = 0;
+    uint16_t z = 0;
+    uint16_t rcode = (opcode == 0) ? 0 : 4;
+
+    response_header.flags = htons((qr << 15) | (opcode << 11) | (aa << 10) | (tc << 9) | (rd << 8) | (ra << 7) | (z << 4) | rcode);
+    
+    response_header.qdcount = htons(1);
+    response_header.ancount = htons(1);
+    response_header.nscount = htons(0);
+    response_header.arcount = htons(0);
+
+    memcpy(response, &response_header, sizeof(DNSHeader));
 }
 
 size_t create_question(char* response) {
@@ -104,20 +120,27 @@ int main() {
                                  reinterpret_cast<struct sockaddr*>(&clientAddress), 
                                  &clientAddrLen);
         if (bytesRead == -1) {
-            perror("Error receiving data");
+            std::cerr << "Error receiving data: " << strerror(errno) << std::endl;
             continue;
         }
 
+        if (bytesRead < sizeof(DNSHeader)) {
+            std::cerr << "Received packet is too small to be a valid DNS query" << std::endl;
+            continue;
+        }
+
+        DNSHeader* request_header = reinterpret_cast<DNSHeader*>(buffer);
+
         // Create DNS response
-        create_dns_header(response);
-        size_t questionSize = create_question(response + 12);
-        size_t answerSize = create_answer(response + 12 + questionSize);
-        size_t responseSize = 12 + questionSize + answerSize;
+        create_dns_header(response, *request_header);
+        size_t questionSize = create_question(response + sizeof(DNSHeader));
+        size_t answerSize = create_answer(response + sizeof(DNSHeader) + questionSize);
+        size_t responseSize = sizeof(DNSHeader) + questionSize + answerSize;
 
         if (sendto(udpSocket, response, responseSize, 0, 
                    reinterpret_cast<struct sockaddr*>(&clientAddress), 
                    sizeof(clientAddress)) == -1) {
-            perror("Failed to send response");
+            std::cerr << "Failed to send response: " << strerror(errno) << std::endl;
         }
     }
 
